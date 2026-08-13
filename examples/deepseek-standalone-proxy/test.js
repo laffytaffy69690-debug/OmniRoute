@@ -33,6 +33,21 @@ async function runTests() {
 
   let exitCode = 0;
   try {
+    // ── Test 0: Model List Discovery ────────────────────────────────────────
+    console.log("\n🧪 Test 0: Running model list discovery...");
+    const resp0 = await fetch(`http://localhost:${PORT}/v1/models`, {
+      method: "GET"
+    });
+
+    assert.equal(resp0.status, 200, "Model list should return status 200");
+    const data0 = await resp0.json();
+    console.log("Response (models):", JSON.stringify(data0, null, 2));
+    assert.equal(data0.object, "list", "Should be an object of type 'list'");
+    assert.ok(Array.isArray(data0.data), "Should return an array of models");
+    assert.ok(data0.data.some(m => m.id === "deepseek-v4-pro"), "Should include deepseek-v4-pro");
+    assert.ok(data0.data.some(m => m.id === "deepseek-v4-flash-think-search"), "Should include deepseek-v4-flash-think-search");
+
+
     // ── Test 1: Standard Non-Streaming Completions ──────────────────────────
     console.log("\n🧪 Test 1: Running standard non-streaming completions...");
     const resp1 = await fetch(`http://localhost:${PORT}/v1/chat/completions`, {

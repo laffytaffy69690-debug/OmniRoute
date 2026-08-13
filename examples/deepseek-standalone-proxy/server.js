@@ -5,6 +5,7 @@
 //
 // Features:
 // - Standalone: Exposes standard /v1/chat/completions endpoint using native Node.js HTTP.
+// - Model Discovery: Exposes standard /v1/models endpoint listing all pro, flash, think, and search variants.
 // - Session Persistence & Caching: Caches short-lived access tokens to limit /users/current calls.
 // - Real-time PoW Solving: Integrates the pure JS Keccak solver to answer challenges dynamically.
 // - OpenAI Stream Formatting: Converts DeepSeek's custom events into standard SSE and stop/stop reasons.
@@ -31,6 +32,23 @@ const FAKE_HEADERS = {
   "X-Client-Platform": "web",
   "X-Client-Version": "2.0.0",
 };
+
+const MODELS = [
+  { "id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-pro-think", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-pro-search", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-pro-think-search", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-flash-think", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-flash-search", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-v4-flash-think-search", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-chat", "object": "model", "owned_by": "deepseek" },
+  { "id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek" },
+  { "id": "DeepSeek-R1", "object": "model", "owned_by": "deepseek" },
+  { "id": "DeepSeek-R1-Search", "object": "model", "owned_by": "deepseek" },
+  { "id": "DeepSeek-V3.2", "object": "model", "owned_by": "deepseek" },
+  { "id": "DeepSeek-Search", "object": "model", "owned_by": "deepseek" }
+];
 
 // Token cache (userToken -> { accessToken, expiresAt })
 const tokenCache = new Map();
@@ -626,6 +644,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  // Model list endpoint
+  if (req.url === "/v1/models" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: MODELS }));
     return;
   }
 
