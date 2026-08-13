@@ -1,0 +1,20 @@
+{
+  "name": "deepseek-standalone-proxy",
+  "version": "1.0.0",
+  "description": "An extremely lean, standalone, zero-dependency reverse proxy for DeepSeek Web",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "deepseek",
+    "reverse-proxy",
+    "openai-compatible",
+    "standalone",
+    "zero-dependencies"
+  ],
+  "author": "",
+  "license": "MIT"
+}
