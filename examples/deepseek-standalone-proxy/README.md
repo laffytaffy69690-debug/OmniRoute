@@ -7,6 +7,7 @@ Perfect for integrating DeepSeek models with existing OpenAI-compatible develope
 ## Features
 
 - **OpenAI-Compatible Endpoint**: Exposes standard `/v1/chat/completions` API.
+- **Model Discovery (`GET /v1/models`)**: Lists all 14 official and custom pro, flash, think, and search variants so compatible clients can discover them automatically.
 - **DeepSeek Proof of Work (PoW) Solver**: Bundles a pure-JavaScript Keccak-256 (SHA-3) sponge construction to dynamically answer and solve upstream PoW challenges.
 - **Support for All Web Models**: Exposes both Default/Pro, R1/Thinking, and Search models.
 - **Dynamic Stream (SSE) Parsing**: Streams results token-by-token and maps them directly to OpenAI formats.
@@ -46,6 +47,41 @@ PORT=8080 npm start
 
 ---
 
+## Integrations with Popular AI Clients
+
+You can configure any tool that supports custom OpenAI-compatible providers to use this proxy:
+
+### 1. Cherry Studio
+1. Open **Cherry Studio Settings** -> **Providers** -> **Custom OpenAI**.
+2. Set **API Key** to your `userToken` (or the raw JSON string `{"value": "..."}`).
+3. Set **API Address** (Base URL) to `http://localhost:20129/v1`
+4. Click **Manage Models** or **Sync Models** to fetch the list of 14 models automatically!
+5. Choose `deepseek-v4-pro-think-search` (or another model) and start chatting!
+
+### 2. Open WebUI
+1. Open **Admin Panel** -> **Settings** -> **Connections** -> **OpenAI API**.
+2. Add a connection:
+   - **API Base URL**: `http://localhost:20129/v1`
+   - **API Key**: `YOUR_DEEPSEEK_USER_TOKEN`
+3. Save, and all models will be fully discovered and available in the dashboard!
+
+### 3. Page Assist
+1. Open **Page Assist Settings** -> **Providers** -> **OpenAI**.
+2. Enable custom endpoint and enter:
+   - **Endpoint URL**: `http://localhost:20129/v1`
+   - **API Key**: `YOUR_DEEPSEEK_USER_TOKEN`
+3. Click Save, and select any DeepSeek model from the list.
+
+### 4. Cline (VS Code Extension)
+1. In Cline Settings, select **OpenAI Compatible** as the Provider.
+2. Enter:
+   - **Base URL**: `http://localhost:20129/v1`
+   - **API Key**: `YOUR_DEEPSEEK_USER_TOKEN`
+   - **Model ID**: `deepseek-v4-pro-think-search` or `deepseek-reasoner`
+3. Now Cline can execute tasks, use VS Code tools/functions, and reason using R1!
+
+---
+
 ## API Endpoints
 
 ### Chat Completions (`POST /v1/chat/completions`)
@@ -79,6 +115,14 @@ curl http://localhost:20129/v1/chat/completions \
   }'
 ```
 
+### Models Discovery (`GET /v1/models`)
+
+Lists all supported DeepSeek models.
+
+```bash
+curl http://localhost:20129/v1/models
+```
+
 ---
 
 ## Running Live Integration Tests
@@ -87,5 +131,5 @@ We have included a robust live test suite (`test.js`) that verifies standard com
 
 ```bash
 # Run the test suite with your userToken
-PORT=20129 node test.js
+DEEPSEEK_USER_TOKEN="YOUR_DEEPSEEK_USER_TOKEN" PORT=20129 node test.js
 ```

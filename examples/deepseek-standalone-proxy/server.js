@@ -55,7 +55,6 @@ const tokenCache = new Map();
 
 // Helper to extract the userToken from credentials
 function extractUserToken(authHeader) {
-  // Try Authorization header first (Bearer <token>)
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const raw = authHeader.slice(7).trim();
     try {
@@ -110,7 +109,7 @@ async function acquireAccessToken(userToken) {
   const accessToken = bizData.token;
   tokenCache.set(userToken, {
     accessToken,
-    expiresAt: Math.floor(Date.now() / 1000) + 3500, // expire slightly early (DeepSeek token has 1h life)
+    expiresAt: Math.floor(Date.now() / 1000) + 3500,
   });
 
   return accessToken;
@@ -216,61 +215,309 @@ function serializeToolsPrompt(tools, nonce) {
     `- Include the secret binding "_nonce": "${nonce}" exactly as shown.`,
     '- "name" must be one of the tools below; "arguments" must be a JSON object.',
     "- When a tool is needed, emit the <tool> block instead of only describing the plan.",
+    "- Emit one <tool> block per call; you may put several blocks back to back.",
+    "- If no tool is needed, just answer normally without any <tool> block.",
     "",
     "Available tools:",
     ...lines,
   ].join("\n");
 }
 
+function buildToolReminder(toolPrompt) {
+  const names = (toolPrompt.match(/^- [^:\n]+/gm) || []).map((s) => s.slice(2).trim()).join(", ");
+  return (
+    "\n\n[Client protocol reminder: the client-tool contract in the system instructions " +
+    "is active in this conversation. These client tools ARE available via the <tool> " +
+    "block protocol" +
+    (names ? ": " + names : "") +
+    ".]"
+  );
+}
+
+function tokenizeToolTags(text) {
+  const tokens = [];
+  const tagRe = /<(\/?)(?:tool_call|tool)(:[A-Za-z0-9_.+-]+)?((?:\s[^>]*)?)\/?>/g;
+  let m;
+  while ((m = tagRe.exec(text)) !== null) {
+    tokens.push({
+      start: m.index,
+      end: tagRe.lastIndex,
+      closing: m[1] === "/",
+      suffix: m[2] ? m[2].slice(1) : "",
+      attrs: m[3] || "",
+    });
+  }
+  return tokens;
+}
+
+function pairToolBlocks(tokens, textLen) {
+  const blocks = [];
+  const stack = [];
+  for (const tok of tokens) {
+    if (!tok.closing) {
+      stack.push(tok);
+      continue;
+    }
+    const open = stack.pop();
+    if (!open) continue;
+    blocks.push({ open, close: tok, innerStart: open.end, innerEnd: tok.start });
+  }
+  for (const open of stack) {
+    const synthetic = {
+      start: textLen,
+      end: textLen,
+      closing: true,
+      suffix: "",
+      attrs: "",
+    };
+    blocks.push({ open, close: synthetic, innerStart: open.end, innerEnd: textLen });
+  }
+  return blocks;
+}
+
+function getAttr(attrs, name) {
+  const re = new RegExp(`\\b${name}\\s*=\\s*("|')`);
+  const m = re.exec(attrs);
+  if (!m) return null;
+  const quote = m[1];
+  let j = m.index + m[0].length;
+  let out = "";
+  while (j < attrs.length) {
+    const ch = attrs[j];
+    if (ch === "\\") {
+      out += attrs[j + 1] ?? "";
+      j += 2;
+      continue;
+    }
+    if (ch === quote) break;
+    out += ch;
+    j += 1;
+  }
+  return out;
+}
+
+function getXmlChild(inner, tag) {
+  const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i").exec(inner);
+  return m ? m[1].trim() : null;
+}
+
+function buildArgsFromParameters(inner) {
+  const paramRe = /<parameter\b([^>]*?)\/?>(?:((?:(?!<parameter\b)[\s\S])*?)<\/parameter>)?/gi;
+  const out = {};
+  let found = false;
+  let m;
+  while ((m = paramRe.exec(inner)) !== null) {
+    const attrs = m[1] || "";
+    const body = m[2];
+    const name = getAttr(attrs, "name");
+    if (!name) continue;
+    const value = getAttr(attrs, "content") ?? (typeof body === "string" ? body.trim() : "");
+    out[name] = value;
+    found = true;
+  }
+  return found ? out : null;
+}
+
+function convertSingleQuotedStrings(value) {
+  let result = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+
+  for (const ch of value) {
+    if (escaped) {
+      result += ch === '"' && inSingle ? '\\"' : ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      result += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      if (inSingle) {
+        result += '\\"';
+      } else {
+        inDouble = !inDouble;
+        result += ch;
+      }
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      result += '"';
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
+
+function replacePythonLiterals(value) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  let token = "";
+
+  const flushToken = () => {
+    if (token === "True") result += "true";
+    else if (token === "False") result += "false";
+    else if (token === "None") result += "null";
+    else result += token;
+    token = "";
+  };
+
+  for (const ch of value) {
+    if (escaped) {
+      if (token) flushToken();
+      result += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      if (token) flushToken();
+      result += ch;
+      escaped = inString;
+      continue;
+    }
+    if (ch === '"') {
+      if (token) flushToken();
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+    if (!inString && /[A-Za-z]/.test(ch)) {
+      token += ch;
+      continue;
+    }
+    if (token) flushToken();
+    result += ch;
+  }
+  if (token) flushToken();
+  return result;
+}
+
+function normalizeLooseJson(value) {
+  return replacePythonLiterals(convertSingleQuotedStrings(value))
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
+function stripCodeFence(value) {
+  return value
+    .trim()
+    .replace(/^```(?:json|javascript|js|python)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function parseLooseJsonObject(raw) {
+  const trimmed = stripCodeFence(raw);
+  for (const candidate of [trimmed, normalizeLooseJson(trimmed)]) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
+function extractCall(tagName, innerRaw, requestedNames) {
+  const inner = innerRaw.trim();
+  const nameChild = getXmlChild(inner, "name");
+  const argsChild = getXmlChild(inner, "arguments") ?? getXmlChild(inner, "parameters");
+  const paramObj = argsChild ? null : buildArgsFromParameters(inner);
+  const hasXmlChildren = !!nameChild || !!argsChild || !!paramObj;
+
+  const json = hasXmlChildren ? null : parseLooseJsonObject(inner);
+  const jsonName = json ? (json.name || json.type) : null;
+
+  let name = nameChild || jsonName || tagName;
+  if (!name) return null;
+
+  if (requestedNames.includes(name)) {
+    // exact match
+  } else {
+    const matched = requestedNames.find(n => n.toLowerCase() === name.toLowerCase());
+    if (matched) name = matched;
+  }
+
+  let argsValue;
+  if (argsChild) {
+    argsValue = parseLooseJsonObject(argsChild) ?? argsChild;
+  } else if (paramObj) {
+    argsValue = paramObj;
+  } else if (json) {
+    if (json.arguments !== undefined) argsValue = json.arguments;
+    else if (json.params !== undefined) argsValue = json.params;
+    else if (name === tagName) {
+      argsValue = json;
+    } else {
+      const { name: _n, type: _t, id: _i, command: _c, arguments: _a, params: _p, ...rest } = json;
+      argsValue = rest;
+    }
+  } else {
+    argsValue = {};
+  }
+
+  const argsStr = typeof argsValue === "object" ? JSON.stringify(argsValue) : String(argsValue || "{}");
+  return { name, arguments: argsStr };
+}
+
 function parseToolCalls(text, nonce, tools) {
-  if (typeof text !== "string" || !text.includes("<tool>")) {
+  if (typeof text !== "string" || (!text.includes("<tool>") && !text.includes("<tool_call>"))) {
     return { content: text, toolCalls: null };
   }
 
-  const toolCalls = [];
-  const tagRe = /<tool>\s*([\s\S]*?)\s*<\/tool>/g;
-  let match;
-  let content = text;
-  const ranges = [];
+  const tokens = tokenizeToolTags(text);
+  if (tokens.length === 0) return { content: text, toolCalls: null };
 
   const requestedNames = (tools || []).map(t => t?.function?.name).filter(Boolean);
+  const blocks = pairToolBlocks(tokens, text.length);
 
-  while ((match = tagRe.exec(text)) !== null) {
-    const inner = match[1].trim();
-    try {
-      // Loose JSON parse
-      const parsed = JSON.parse(inner.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3').replace(/,\s*([}\]])/g, "$1"));
-      if (parsed && typeof parsed.name === "string") {
-        if (nonce && parsed._nonce !== nonce) continue; // Nonce validation
-        if (requestedNames.length > 0 && !requestedNames.includes(parsed.name)) continue;
+  const isLeaf = (b) =>
+    !blocks.some((o) => o !== b && o.open.start >= b.innerStart && o.close.end <= b.innerEnd);
 
-        const args = typeof parsed.arguments === "object" ? JSON.stringify(parsed.arguments) : String(parsed.arguments || "{}");
-        toolCalls.push({
-          id: `call_${Math.random().toString(36).slice(2, 10)}`,
-          type: "function",
-          function: { name: parsed.name, arguments: args }
-        });
-        ranges.push({ start: match.index, end: tagRe.lastIndex });
+  const toolCalls = [];
+  const acceptedRanges = [];
+
+  for (const block of blocks.filter(isLeaf).sort((a, b) => a.open.start - b.open.start)) {
+    const tagName = block.open.suffix || getAttr(block.open.attrs, "name") || getAttr(block.open.attrs, "id") || "";
+    const inner = text.slice(block.innerStart, block.innerEnd);
+    const call = extractCall(tagName, inner, requestedNames);
+    if (!call) continue;
+
+    if (nonce) {
+      const parsed = parseLooseJsonObject(inner);
+      if (parsed && typeof parsed.name === "string" && parsed._nonce !== undefined && parsed._nonce !== nonce) {
+        continue;
       }
-    } catch {
-      // ignore malformed
     }
+
+    toolCalls.push({
+      id: `call_${Math.random().toString(36).slice(2, 10)}`,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments },
+    });
+    acceptedRanges.push({ start: block.open.start, end: block.close.end });
   }
 
-  // Strip accepted tags from content
-  if (toolCalls.length > 0) {
-    const sortedRanges = ranges.sort((a, b) => b.start - a.start);
-    for (const range of sortedRanges) {
-      content = content.slice(0, range.start) + content.slice(range.end);
-    }
-    content = content.replace(/\n{3,}/g, "\n\n").trim();
-    return { content, toolCalls };
+  if (toolCalls.length === 0) {
+    return { content: text, toolCalls: null };
   }
 
-  return { content: text, toolCalls: null };
+  const sortedRanges = acceptedRanges.sort((a, b) => b.start - a.start);
+  let content = text;
+  for (const range of sortedRanges) {
+    content = content.slice(0, range.start) + content.slice(range.end);
+  }
+  content = content.replace(/\n{3,}/g, "\n\n").trim();
+  return { content, toolCalls };
 }
 
-// ── Prompt Formatting ────────────────────────────────────────────────────────
+// ── Prompt Formatting & Trajectory Replay ────────────────────────────────────
 
 function messagesToPrompt(messages, toolPrompt) {
   const systemParts = [];
@@ -278,6 +525,7 @@ function messagesToPrompt(messages, toolPrompt) {
 
   const lines = [];
   const callNameById = new Map();
+  let sawToolActivity = false;
 
   for (const m of messages) {
     const text = String(m.content || "").trim();
@@ -291,8 +539,11 @@ function messagesToPrompt(messages, toolPrompt) {
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           if (tc?.function?.name) {
-            callNameById.set(tc.id, tc.function.name);
-            parts.push(`<tool>{"name": "${tc.function.name}", "arguments": ${tc.function.arguments}}</tool>`);
+            const tcName = tc.function.name;
+            const tcArgs = typeof tc.function.arguments === "object" ? JSON.stringify(tc.function.arguments) : String(tc.function.arguments || "{}");
+            callNameById.set(tc.id, tcName);
+            parts.push(`<tool>{"name": "${tcName}", "arguments": ${tcArgs}}</tool>`);
+            sawToolActivity = true;
           }
         }
       }
@@ -300,12 +551,19 @@ function messagesToPrompt(messages, toolPrompt) {
     } else if (m.role === "tool") {
       const name = callNameById.get(m.tool_call_id) || m.name || "tool";
       lines.push(`Tool result (${name}): ${text || "(no output)"}`);
+      sawToolActivity = true;
     }
   }
 
   const finalParts = [];
   if (systemParts.length > 0) finalParts.push(systemParts.join("\n\n"));
   if (lines.length > 0) finalParts.push(lines.join("\n\n"));
+  if (sawToolActivity) {
+    finalParts.push(
+      "Continue the task using the tool results above. Do NOT repeat tool calls that already " +
+      "succeeded; perform the next step or give the final answer."
+    );
+  }
 
   return finalParts.join("\n\n");
 }
@@ -316,8 +574,8 @@ function cleanStreamTokens(text) {
   return text.replace(/FINISHED/g, "").replace(/^(SEARCH|WEB_SEARCH|SEARCHING)\s*/i, "");
 }
 
-function makeUnifiedParser(onText, onThinkingText, onSearchResults, initialPath = "content") {
-  let currentPath = initialPath;
+function makeUnifiedParser(onText, onThinkingText, onSearchResults) {
+  let currentPath = "";
 
   const sendByPath = (raw) => {
     const text = cleanStreamTokens(raw);
@@ -348,7 +606,7 @@ function makeUnifiedParser(onText, onThinkingText, onSearchResults, initialPath 
 
   return {
     parseLine(line) {
-      if (!line.startsWith("data: ")) return;
+      if (!line.startsWith("data: ") && !line.startsWith("data:")) return;
       const payload = line.replace(/^data:\s*/, "").trim();
       if (payload === "[DONE]") return;
 
@@ -432,7 +690,19 @@ async function handleCompletions(req, res, reqBody) {
     const nonce = Math.random().toString(36).slice(2, 10);
     const toolPrompt = tools.length > 0 ? serializeToolsPrompt(tools, nonce) : "";
 
-    const prompt = messagesToPrompt(messages, toolPrompt);
+    // Dual-placement for tool calling
+    const effectiveMessages = [...messages];
+    if (tools.length > 0) {
+      const reminder = buildToolReminder(toolPrompt);
+      for (let i = effectiveMessages.length - 1; i >= 0; i--) {
+        if (effectiveMessages[i]?.role === "user") {
+          effectiveMessages[i] = { ...effectiveMessages[i], content: effectiveMessages[i].content + reminder };
+          break;
+        }
+      }
+    }
+
+    const prompt = messagesToPrompt(effectiveMessages, toolPrompt);
 
     // 1. Authenticate with DeepSeek
     const accessToken = await acquireAccessToken(userToken);
@@ -523,8 +793,7 @@ async function handleCompletions(req, res, reqBody) {
         },
         (results) => {
           searchResults.push(...results);
-        },
-        isThinking ? "thinking" : "content"
+        }
       );
 
       try {
@@ -571,8 +840,7 @@ async function handleCompletions(req, res, reqBody) {
       const parser = makeUnifiedParser(
         (txt) => { content += txt; },
         (txt) => { reasoningContent += txt; },
-        (results) => { searchResults.push(...results); },
-        isThinking ? "thinking" : "content"
+        (results) => { searchResults.push(...results); }
       );
 
       while (true) {
